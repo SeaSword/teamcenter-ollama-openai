@@ -15,4 +15,4 @@ types-aiofiles
 # Testing utilities
 httpx
 respx>=0.20.0
-faker>=20.0.0
+faker>=40.44.0
