@@ -1,0 +1,397 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches: [ master, develop ]
+  push:
+    branches: [ master ]
+
+env:
+  DOCKER_BUILDKIT: 1
+  CI_IMAGE_NAME: ollama-openai-proxy-ci
+
+jobs:
+  build-ci-image:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Generate image metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.CI_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+    
+    - name: Build CI Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./docker/Dockerfile.ci
+        push: false
+        tags: ${{ env.CI_IMAGE_NAME }}:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=docker,dest=/tmp/ci-image.tar
+    
+    - name: Upload Docker image
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-image
+        path: /tmp/ci-image.tar
+        retention-days: 1
+
+  lint-and-format:
+    runs-on: ubuntu-latest
+    needs: build-ci-image
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download CI Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: ci-image
+        path: /tmp
+    
+    - name: Load Docker image
+      run: docker load --input /tmp/ci-image.tar
+    
+    - name: Run ruff linter
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/app \
+          -w /app \
+          --user $(id -u):$(id -g) \
+          ${{ env.CI_IMAGE_NAME }}:${{ github.sha }} \
+          ruff check src/ tests/ --output-format=github
+    
+    - name: Run black formatter check
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/app \
+          -w /app \
+          --user $(id -u):$(id -g) \
+          ${{ env.CI_IMAGE_NAME }}:${{ github.sha }} \
+          black --check src/ tests/
+    
+    - name: Run mypy type checker
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/app \
+          -w /app \
+          --user $(id -u):$(id -g) \
+          ${{ env.CI_IMAGE_NAME }}:${{ github.sha }} \
+          mypy src/ --ignore-missing-imports --allow-untyped-defs --allow-incomplete-defs
+      continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build-ci-image
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download CI Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: ci-image
+        path: /tmp
+    
+    - name: Load Docker image
+      run: docker load --input /tmp/ci-image.tar
+    
+    - name: Run pytest with coverage
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/app \
+          -w /app \
+          -e OPENAI_API_BASE_URL=${{ secrets.TEST_OPENAI_API_BASE_URL || 'https://api.test.com' }} \
+          -e OPENAI_API_KEY=${{ secrets.TEST_OPENAI_API_KEY || 'test-key' }} \
+          --user $(id -u):$(id -g) \
+          ${{ env.CI_IMAGE_NAME }}:${{ github.sha }} \
+          pytest tests/unit/ -v --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=10 --ignore=tests/unit/test_main.py
+    
+    - name: Fix coverage file permissions
+      run: |
+        sudo chown -R $USER:$USER coverage.xml htmlcov/ || true
+    
+    - name: Generate coverage badge
+      run: |
+        # Extract coverage percentage from coverage.xml
+        if [ -f coverage.xml ]; then
+          COVERAGE=$(python -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          root = tree.getroot()
+          coverage = float(root.attrib['line-rate']) * 100
+          print(f'{coverage:.1f}')
+          " 2>/dev/null || echo "0.0")
+          echo "COVERAGE_PERCENTAGE=$COVERAGE" >> $GITHUB_ENV
+          echo "Coverage: $COVERAGE%"
+        fi
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+        verbose: true
+        env_vars: OS,PYTHON
+        slug: eyalrot/ollama_openai
+
+    - name: Upload coverage HTML report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: coverage-report-${{ github.sha }}
+        path: htmlcov/
+        retention-days: 30
+
+    - name: Coverage Summary
+      if: github.event_name == 'pull_request'
+      run: |
+        echo "## 📊 Test Coverage Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f coverage.xml ]; then
+          echo "**Coverage**: ${COVERAGE_PERCENTAGE}%" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📈 [View detailed coverage report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          
+          # Add coverage threshold check
+          THRESHOLD=10
+          if (( $(echo "$COVERAGE_PERCENTAGE >= $THRESHOLD" | bc -l) )); then
+            echo "✅ Coverage meets threshold ($THRESHOLD%)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Coverage below threshold ($THRESHOLD%)" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "❌ Coverage report not generated" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Comment coverage on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const coverage = process.env.COVERAGE_PERCENTAGE || '0.0';
+          const threshold = 10;
+          const status = parseFloat(coverage) >= threshold ? '✅' : '❌';
+          const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+          
+          const body = `## 📊 Coverage Report
+          
+          **Coverage**: ${coverage}% ${status}
+          **Threshold**: ${threshold}%
+          
+          📈 [View detailed report](${runUrl})
+          📋 [Download HTML report](${runUrl})
+          
+          ${parseFloat(coverage) >= threshold ? 
+            '✅ Coverage meets the required threshold!' : 
+            '❌ Coverage is below the required threshold. Please add more tests.'}
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [build-ci-image, test]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download CI Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: ci-image
+        path: /tmp
+    
+    - name: Load Docker image
+      run: docker load --input /tmp/ci-image.tar
+    
+    - name: Run integration tests
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/app \
+          -w /app \
+          -e OPENAI_API_BASE_URL=https://api.test.com \
+          -e OPENAI_API_KEY=test-key \
+          --user $(id -u):$(id -g) \
+          ${{ env.CI_IMAGE_NAME }}:${{ github.sha }} \
+          pytest tests/unit/ -v -k "test_valid_configuration or test_ollama_chat_request"
+
+  docker-build-prod:
+    runs-on: ubuntu-latest
+    needs: [lint-and-format, test]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build production Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./docker/Dockerfile.prod
+        push: false
+        tags: ollama-openai-proxy:prod
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        load: true
+    
+    - name: Test production Docker image
+      run: |
+        # Test that the image starts correctly
+        docker run -d --name test-container \
+          -e OPENAI_API_BASE_URL=http://test.com \
+          -e OPENAI_API_KEY=test \
+          -p 11434:11434 \
+          ollama-openai-proxy:prod
+        
+        # Wait for container to be ready
+        sleep 10
+        
+        # Check if container is still running
+        docker ps | grep test-container
+        
+        # Check logs for any errors
+        docker logs test-container
+        
+        # Try to access health endpoint
+        curl -f http://localhost:11434/health || (docker logs test-container && exit 1)
+        
+        # Cleanup
+        docker stop test-container
+        docker rm test-container
+    
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ollama-openai-proxy:prod
+        format: 'table'
+        exit-code: '0'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+
+  validate-docker-compose:
+    runs-on: ubuntu-latest
+    needs: build-ci-image
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create test .env file
+      run: |
+        cat > .env << EOF
+        OPENAI_API_BASE_URL=http://test-server:8000/v1
+        OPENAI_API_KEY=test-key
+        PROXY_PORT=11434
+        LOG_LEVEL=INFO
+        MODEL_MAPPING_FILE=config/model_map.json
+        EOF
+    
+    - name: Validate docker-compose files
+      run: |
+        # Validate main compose file
+        docker compose -f docker-compose.yml config
+        
+        # Validate development compose
+        docker compose -f docker/docker-compose.dev.yml config
+        
+        # Validate production compose
+        docker compose -f docker/docker-compose.prod.yml config
+    
+    - name: Test docker-compose up (dry run)
+      run: |
+        docker compose -f docker-compose.yml config > /tmp/compose-config.yml
+        echo "Docker compose configuration is valid"
+
+  build-python-package:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    needs: [lint-and-format, test]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for proper versioning
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: 'pip'
+    
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine setuptools wheel
+    
+    - name: Install project dependencies
+      run: |
+        pip install -e .
+    
+    - name: Verify package configuration
+      run: |
+        python -c "from src._version import __version__; print(f'Package version: {__version__}')"
+        python -c "import src.config, src.models; print(f'Package can be imported successfully')"
+    
+    - name: Build package
+      run: |
+        python -m build --sdist --wheel --outdir dist/
+    
+    - name: Check package contents
+      run: |
+        ls -la dist/
+        python -m twine check dist/*
+    
+    - name: Test wheel installation
+      run: |
+        pip install dist/*.whl
+        python -c "import config, models, _version; print('Package imported successfully')"
+        python -c "from _version import __version__; print(f'Installed version: {__version__}')"
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+        retention-days: 7
+    
+    - name: Package build summary
+      run: |
+        echo "## 📦 Python Package Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Package Files Built:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        ls -la dist/ >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Package Information:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Version**: \`$(python -c 'from src._version import __version__; print(__version__)')\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "- **Installation Test**: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📥 [Download artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
